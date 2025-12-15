@@ -2,12 +2,58 @@ from xattn.src.utils import *
 import torch
 import math
 import torch.nn.functional as F
+from typing import Optional
 from xattn.src.kernels import (
     flat_group_gemm,
     softmax_fuse_block_sum,
     flat_group_gemm_fuse_reshape,
 )
 from block_sparse_attn import block_sparse_attn_func
+
+def top_p_mask(attn_prob: torch.Tensor, threshold: Optional[float | torch.Tensor]):
+    """
+    attn_prob: [B, H, q_block_num, kv_block_num], softmax 后
+    threshold: 0 < threshold <= 1
+    return: bool mask [B, H, q_block_num, kv_block_num]
+    """
+    B, H, q_block_num, kv_block_num = attn_prob.shape
+    if isinstance(threshold, torch.Tensor):
+        assert threshold.shape[0] == H
+        assert threshold.ndim == 1
+        threshold = threshold.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+    # -> 1, H, 1, 1
+    
+    # sort (descending)
+    sorted_prob, sorted_idx = torch.sort(
+        attn_prob, dim=-1, descending=True
+    )
+    # -> B, H, q_block_num, kv_block_num
+
+    # cumulative sum
+    cumsum = sorted_prob.cumsum(dim=-1)
+    # -> B, H, q_block_num, kv_block_num
+
+    # nucleus condition
+    nucleus = ~(cumsum > threshold)
+    # -> B, H, q_block_num, kv_block_num
+
+    # at least choose one（top-1）
+    nucleus[..., 0] = True
+    index = torch.where(nucleus, sorted_idx, 0)
+    # -> B, H, q_block_num, kv_block_num
+
+    # 5. scatter 
+    mask = torch.zeros_like(attn_prob, dtype=torch.bool)
+    # mask.scatter_(-1, sorted_idx, nucleus)        # note: scatter to slow
+    
+    # another implement
+    index = index.view(-1, kv_block_num)
+    mask = mask.view(-1, kv_block_num)
+    bhq_idx = torch.arange(mask.shape[0], device=mask.device).unsqueeze(-1)
+    mask[bhq_idx, index] = True
+    mask = mask.view(B, H, q_block_num, kv_block_num)
+
+    return mask
 
 
 def xattn_estimate(
@@ -25,252 +71,297 @@ def xattn_estimate(
     kdb: int = 1,
     keep_sink=False,
     keep_recent=False,
+    use_pooling=False
 ) -> torch.Tensor:
     batch_size, num_kv_head, k_len, head_dim = key_states.shape
     batch_size, num_q_head, q_len, head_dim = query_states.shape
     assert num_q_head == num_kv_head
 
-    k_num_to_pad = ((k_len + chunk_size - 1) // chunk_size) * chunk_size - k_len
-    q_num_to_pad = ((q_len + chunk_size - 1) // chunk_size) * chunk_size - q_len
-    k_chunk_num = (k_len + k_num_to_pad) // chunk_size
-    k_block_num = (k_len + k_num_to_pad) // block_size
-    q_chunk_num = (q_len + q_num_to_pad) // chunk_size
-    q_block_num = (q_len + q_num_to_pad) // block_size
-    assert k_chunk_num >= q_chunk_num
-    offset_token_chunk_num = k_chunk_num - q_chunk_num
+    if use_pooling:
+        k_num_to_pad = ((k_len + block_size - 1) // block_size) * block_size - k_len
+        q_num_to_pad = ((q_len + block_size - 1) // block_size) * block_size - q_len
+        k_block_num = (k_len + k_num_to_pad) // block_size
+        q_block_num = (q_len + q_num_to_pad) // block_size
+        q_block_offset = k_block_num - q_block_num
+        assert q_block_offset >= 0
 
-    if k_num_to_pad > 0:
-        pad_key_states = F.pad(key_states, (0, 0, 0, k_num_to_pad), value=0).to("cuda")
-    else:
-        pad_key_states = key_states
-    if q_num_to_pad > 0:
-        pad_query_states = F.pad(query_states, (0, 0, 0, q_num_to_pad), value=0).to(
-            "cuda"
-        )
-    else:
-        pad_query_states = query_states
-
-    assert num_kv_head == num_q_head
-    attn_sum_list = []
-    simple_mask_list = []
-
-    if use_triton and (
-        "100" not in torch.cuda.get_device_properties(torch.cuda.current_device()).name
-    ):
-        use_triton = False
-        print(
-            "setting use triton to false. Triton kernel not surpported on this device"
-        )
-
-    reshaped_chunk_size = chunk_size // stride
-    reshaped_block_size = block_size // stride
-    k_reshaped_num_to_pad = k_num_to_pad // stride
-    k_reshaped_seq_len = (k_len + k_num_to_pad) // stride
-    q_reshaped_num_to_pad = q_num_to_pad // stride
-    num_blocks_per_chunk = reshaped_chunk_size // reshaped_block_size
-    if not use_triton:
-        if select_mode == "random":
-            perm_idx = torch.randperm(stride)
-            reshaped_key = torch.cat(
-                [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
-            )
-            reshaped_query = torch.cat(
-                [
-                    pad_query_states[:, :, perm_idx[i] :: stride, :]
-                    for i in range(stride)
-                ],
-                dim=-1,
-            )
-        elif select_mode == "inverse" or select_mode == "":
-            reshaped_key = torch.cat(
-                [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
-            )
-            reshaped_query = torch.cat(
-                [
-                    (pad_query_states[:, :, (stride - 1 - q) :: (stride * kdb), :])
-                    for q in range(stride)
-                ],
-                dim=-1,
-            )
-        elif select_mode == "slash":
-            reshaped_key = torch.cat(
-                [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
-            )
-            reshaped_query = torch.cat(
-                [(pad_query_states[:, :, q::stride, :]) for q in range(stride)], dim=-1
-            )
-        elif select_mode == "double":
-            reshaped_key = torch.cat(
-                [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
-            )
-            reshaped_key = reshaped_key + torch.cat(
-                [reshaped_key[:, :, :, head_dim:], reshaped_key[:, :, :, 0:head_dim]],
-                dim=-1,
-            )
-            reshaped_query = torch.cat(
-                [
-                    (pad_query_states[:, :, (stride - 1 - q) :: stride, :])
-                    for q in range(stride)
-                ],
-                dim=-1,
-            )
-        elif select_mode == "triple":
-            reshaped_key = torch.cat(
-                [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
-            )
-            reshaped_key = reshaped_key + torch.cat(
-                [reshaped_key[:, :, :, head_dim:], reshaped_key[:, :, :, 0:head_dim]],
-                dim=-1,
-            )
-            reshaped_key = reshaped_key + torch.cat(
-                [reshaped_key[:, :, :, -head_dim:], reshaped_key[:, :, :, 0:-head_dim]],
-                dim=-1,
-            )
-            reshaped_query = torch.cat(
-                [
-                    (pad_query_states[:, :, (stride - 1 - q) :: stride, :])
-                    for q in range(stride)
-                ],
-                dim=-1,
-            )
-        assert reshaped_key.shape[-2] == k_reshaped_seq_len
-
-    for chunk_idx in range(q_chunk_num):
-        if use_triton:
-            if kdb != 1:
-                raise ValueError("use_triton and kdb cannot be used together")
-            attn_weights_slice = flat_group_gemm_fuse_reshape(
-                pad_query_states[
-                    :,
-                    :,
-                    (chunk_idx * reshaped_chunk_size)
-                    * stride : (chunk_idx * reshaped_chunk_size + reshaped_chunk_size)
-                    * stride,
-                    :,
-                ],
-                pad_key_states,
-                stride,
-                (k_block_num - q_block_num) * reshaped_block_size
-                + chunk_idx * reshaped_chunk_size,
-                (k_block_num - q_block_num) * reshaped_block_size
-                + chunk_idx * reshaped_chunk_size
-                + reshaped_chunk_size,
-                is_causal=causal,
-            )
-            attn_sum = softmax_fuse_block_sum(
-                attn_weights_slice,
-                reshaped_block_size,
-                min(4096, reshaped_block_size),
-                (k_block_num - q_block_num) * reshaped_block_size
-                + chunk_idx * reshaped_chunk_size,
-                (k_block_num - q_block_num) * reshaped_block_size
-                + chunk_idx * reshaped_chunk_size
-                + reshaped_chunk_size,
-                k_reshaped_seq_len - k_reshaped_num_to_pad,
-                1.4426950408889634 / math.sqrt(head_dim) / stride / norm,
-                is_causal=causal,
-            )
+        if k_num_to_pad > 0:
+            pad_key_states = F.pad(key_states, (0, 0, 0, k_num_to_pad), value=0).to("cuda")
         else:
-            chunked_query = reshaped_query[
-                :,
-                :,
-                (chunk_idx * reshaped_chunk_size)
-                // kdb : (chunk_idx * reshaped_chunk_size + reshaped_chunk_size)
-                // kdb,
-                :,
-            ]
-            attn_weights_slice = torch.matmul(
-                chunked_query,
-                reshaped_key.transpose(2, 3),
-            ).to("cuda")
-
-            attn_weights_slice = (
-                attn_weights_slice / math.sqrt(head_dim) / stride / norm
+            pad_key_states = key_states
+        if q_num_to_pad > 0:
+            pad_query_states = F.pad(query_states, (0, 0, 0, q_num_to_pad), value=0).to("cuda")
+        else:
+            pad_query_states = query_states
+            
+        pad_key_states_pooling = pad_key_states.view(batch_size, num_kv_head, k_block_num, block_size, head_dim).mean(dim=-2)
+        # -> batch_size, num_kv_head, k_block_num, head_dim
+        pad_query_states_pooling = pad_query_states.view(batch_size, num_q_head, q_block_num, block_size, head_dim).mean(dim=-2)
+        # -> batch_size, num_q_head, q_block_num, head_dim
+        attn_weight = torch.matmul(pad_query_states_pooling, pad_key_states_pooling.transpose(2,3))
+        # -> batch_size, num_q_head, q_block_num, k_block_num
+        if causal:
+            q_idx = torch.arange(q_block_num, device=attn_weight.device)[:, None]
+            kv_idx = torch.arange(k_block_num, device=attn_weight.device)[None, :]
+            attn_weight = torch.where(
+                kv_idx <= q_idx + q_block_offset,
+                attn_weight,
+                torch.full_like(attn_weight, torch.finfo(attn_weight.dtype).min)
             )
-
-            if causal:
-                causal_mask = torch.zeros(
-                    (
-                        batch_size,
-                        num_q_head,
-                        reshaped_chunk_size,
-                        reshaped_chunk_size * k_chunk_num,
-                    ),
-                    device=key_states.device,
-                )
-                causal_mask[:, :, :, (-k_reshaped_num_to_pad):] = float("-inf")
-                chunk_start = (chunk_idx + offset_token_chunk_num) * reshaped_chunk_size
-                chunk_end = chunk_start + reshaped_chunk_size
-                causal_mask[:, :, :, chunk_start:chunk_end] = torch.triu(
-                    torch.ones(
-                        1,
-                        num_q_head,
-                        reshaped_chunk_size,
-                        reshaped_chunk_size,
-                        device=key_states.device,
-                    )
-                    * float("-inf"),
-                    diagonal=1,
-                )
-
-                if chunk_idx == q_chunk_num - 1 and q_reshaped_num_to_pad != 0:
-                    causal_mask[:, :, (-(q_reshaped_num_to_pad // kdb)) :, :] = float(
-                        "-inf"
-                    )
-
-                causal_mask[:, :, :, chunk_end:] = float("-inf")
-                causal_mask = causal_mask[:, :, kdb - 1 :: kdb, :]
-                attn_weights_slice = attn_weights_slice + causal_mask.to(
-                    attn_weights_slice.device
-                )
-
-            if softmax:
-                attn_weights_slice = F.softmax(
-                    attn_weights_slice, dim=-1, dtype=torch.float32
-                ).to(pad_query_states.dtype)
-            else:
-                attn_weights_slice = torch.exp(attn_weights_slice).to(
-                    pad_query_states.dtype
-                )
-            attn_weights_slice = F.dropout(attn_weights_slice, p=0, training=False)
-
-            if chunk_idx == q_chunk_num - 1 and q_reshaped_num_to_pad != 0:
-                attn_weights_slice[:, :, (-(q_reshaped_num_to_pad // kdb)) :, :] = 0
-
-            attn_sum = (
-                attn_weights_slice.view(
-                    batch_size,
-                    num_kv_head,
-                    num_blocks_per_chunk,
-                    reshaped_block_size // kdb,
-                    -1,
-                    reshaped_block_size,
-                )
-                .sum(dim=-1)
-                .sum(dim=-2)
-                .to("cuda")
-            )
-            del chunked_query
-        
-        simple_mask = find_blocks_chunked(
-            attn_sum,
-            k_block_num - q_block_num + chunk_idx * num_blocks_per_chunk,
+        attn_sums = F.softmax(attn_weight, dim=-1, dtype=torch.float32).to(attn_weight.dtype)
+        simple_masks = find_blocks_chunked(
+            attn_sums,
+            k_block_num-q_block_num,
             threshold,
             None,
             decoding=False,
             mode="prefill",
             causal=causal,
         )
+        # simple_masks = top_p_mask(attn_sums, threshold=threshold)
+        # -> speed up, but reduce accuracy
+    else:
+        k_num_to_pad = ((k_len + chunk_size - 1) // chunk_size) * chunk_size - k_len
+        q_num_to_pad = ((q_len + chunk_size - 1) // chunk_size) * chunk_size - q_len
+        k_chunk_num = (k_len + k_num_to_pad) // chunk_size
+        k_block_num = (k_len + k_num_to_pad) // block_size
+        q_chunk_num = (q_len + q_num_to_pad) // chunk_size
+        q_block_num = (q_len + q_num_to_pad) // block_size
+        assert k_chunk_num >= q_chunk_num
+        offset_token_chunk_num = k_chunk_num - q_chunk_num
 
-        attn_sum_list.append(attn_sum)
-        simple_mask_list.append(simple_mask)
+        if k_num_to_pad > 0:
+            pad_key_states = F.pad(key_states, (0, 0, 0, k_num_to_pad), value=0).to("cuda")
+        else:
+            pad_key_states = key_states
+        if q_num_to_pad > 0:
+            pad_query_states = F.pad(query_states, (0, 0, 0, q_num_to_pad), value=0).to(
+                "cuda"
+            )
+        else:
+            pad_query_states = query_states
 
-        del attn_weights_slice
+        assert num_kv_head == num_q_head
+        attn_sum_list = []
+        simple_mask_list = []
 
-    if not use_triton:
-        del reshaped_query, reshaped_key
-    attn_sums = torch.cat(attn_sum_list, dim=-2)
-    simple_masks = torch.cat(simple_mask_list, dim=-2)
+        if use_triton and (
+            "100" not in torch.cuda.get_device_properties(torch.cuda.current_device()).name
+        ):
+            use_triton = False
+            print(
+                "setting use triton to false. Triton kernel not surpported on this device"
+            )
+
+        reshaped_chunk_size = chunk_size // stride
+        reshaped_block_size = block_size // stride
+        k_reshaped_num_to_pad = k_num_to_pad // stride
+        k_reshaped_seq_len = (k_len + k_num_to_pad) // stride
+        q_reshaped_num_to_pad = q_num_to_pad // stride
+        num_blocks_per_chunk = reshaped_chunk_size // reshaped_block_size
+        if not use_triton:
+            if select_mode == "random":
+                perm_idx = torch.randperm(stride)
+                reshaped_key = torch.cat(
+                    [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
+                )
+                reshaped_query = torch.cat(
+                    [
+                        pad_query_states[:, :, perm_idx[i] :: stride, :]
+                        for i in range(stride)
+                    ],
+                    dim=-1,
+                )
+            elif select_mode == "inverse" or select_mode == "":
+                reshaped_key = torch.cat(
+                    [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
+                )
+                reshaped_query = torch.cat(
+                    [
+                        (pad_query_states[:, :, (stride - 1 - q) :: (stride * kdb), :])
+                        for q in range(stride)
+                    ],
+                    dim=-1,
+                )
+            elif select_mode == "slash":
+                reshaped_key = torch.cat(
+                    [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
+                )
+                reshaped_query = torch.cat(
+                    [(pad_query_states[:, :, q::stride, :]) for q in range(stride)], dim=-1
+                )
+            elif select_mode == "double":
+                reshaped_key = torch.cat(
+                    [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
+                )
+                reshaped_key = reshaped_key + torch.cat(
+                    [reshaped_key[:, :, :, head_dim:], reshaped_key[:, :, :, 0:head_dim]],
+                    dim=-1,
+                )
+                reshaped_query = torch.cat(
+                    [
+                        (pad_query_states[:, :, (stride - 1 - q) :: stride, :])
+                        for q in range(stride)
+                    ],
+                    dim=-1,
+                )
+            elif select_mode == "triple":
+                reshaped_key = torch.cat(
+                    [(pad_key_states[:, :, k::stride, :]) for k in range(stride)], dim=-1
+                )
+                reshaped_key = reshaped_key + torch.cat(
+                    [reshaped_key[:, :, :, head_dim:], reshaped_key[:, :, :, 0:head_dim]],
+                    dim=-1,
+                )
+                reshaped_key = reshaped_key + torch.cat(
+                    [reshaped_key[:, :, :, -head_dim:], reshaped_key[:, :, :, 0:-head_dim]],
+                    dim=-1,
+                )
+                reshaped_query = torch.cat(
+                    [
+                        (pad_query_states[:, :, (stride - 1 - q) :: stride, :])
+                        for q in range(stride)
+                    ],
+                    dim=-1,
+                )
+            assert reshaped_key.shape[-2] == k_reshaped_seq_len
+
+        for chunk_idx in range(q_chunk_num):
+            if use_triton:
+                if kdb != 1:
+                    raise ValueError("use_triton and kdb cannot be used together")
+                attn_weights_slice = flat_group_gemm_fuse_reshape(
+                    pad_query_states[
+                        :,
+                        :,
+                        (chunk_idx * reshaped_chunk_size)
+                        * stride : (chunk_idx * reshaped_chunk_size + reshaped_chunk_size)
+                        * stride,
+                        :,
+                    ],
+                    pad_key_states,
+                    stride,
+                    (k_block_num - q_block_num) * reshaped_block_size
+                    + chunk_idx * reshaped_chunk_size,
+                    (k_block_num - q_block_num) * reshaped_block_size
+                    + chunk_idx * reshaped_chunk_size
+                    + reshaped_chunk_size,
+                    is_causal=causal,
+                )
+                attn_sum = softmax_fuse_block_sum(
+                    attn_weights_slice,
+                    reshaped_block_size,
+                    min(4096, reshaped_block_size),
+                    (k_block_num - q_block_num) * reshaped_block_size
+                    + chunk_idx * reshaped_chunk_size,
+                    (k_block_num - q_block_num) * reshaped_block_size
+                    + chunk_idx * reshaped_chunk_size
+                    + reshaped_chunk_size,
+                    k_reshaped_seq_len - k_reshaped_num_to_pad,
+                    1.4426950408889634 / math.sqrt(head_dim) / stride / norm,
+                    is_causal=causal,
+                )
+            else:
+                chunked_query = reshaped_query[
+                    :,
+                    :,
+                    (chunk_idx * reshaped_chunk_size)
+                    // kdb : (chunk_idx * reshaped_chunk_size + reshaped_chunk_size)
+                    // kdb,
+                    :,
+                ]
+                attn_weights_slice = torch.matmul(
+                    chunked_query,
+                    reshaped_key.transpose(2, 3),
+                ).to("cuda")
+
+                attn_weights_slice = (
+                    attn_weights_slice / math.sqrt(head_dim) / stride / norm
+                )
+
+                if causal:
+                    causal_mask = torch.zeros(
+                        (
+                            batch_size,
+                            num_q_head,
+                            reshaped_chunk_size,
+                            reshaped_chunk_size * k_chunk_num,
+                        ),
+                        device=key_states.device,
+                    )
+                    causal_mask[:, :, :, (-k_reshaped_num_to_pad):] = float("-inf")
+                    chunk_start = (chunk_idx + offset_token_chunk_num) * reshaped_chunk_size
+                    chunk_end = chunk_start + reshaped_chunk_size
+                    causal_mask[:, :, :, chunk_start:chunk_end] = torch.triu(
+                        torch.ones(
+                            1,
+                            num_q_head,
+                            reshaped_chunk_size,
+                            reshaped_chunk_size,
+                            device=key_states.device,
+                        )
+                        * float("-inf"),
+                        diagonal=1,
+                    )
+
+                    if chunk_idx == q_chunk_num - 1 and q_reshaped_num_to_pad != 0:
+                        causal_mask[:, :, (-(q_reshaped_num_to_pad // kdb)) :, :] = float(
+                            "-inf"
+                        )
+
+                    causal_mask[:, :, :, chunk_end:] = float("-inf")
+                    causal_mask = causal_mask[:, :, kdb - 1 :: kdb, :]
+                    attn_weights_slice = attn_weights_slice + causal_mask.to(
+                        attn_weights_slice.device
+                    )
+
+                if softmax:
+                    attn_weights_slice = F.softmax(
+                        attn_weights_slice, dim=-1, dtype=torch.float32
+                    ).to(pad_query_states.dtype)
+                else:
+                    attn_weights_slice = torch.exp(attn_weights_slice).to(
+                        pad_query_states.dtype
+                    )
+                attn_weights_slice = F.dropout(attn_weights_slice, p=0, training=False)
+
+                if chunk_idx == q_chunk_num - 1 and q_reshaped_num_to_pad != 0:
+                    attn_weights_slice[:, :, (-(q_reshaped_num_to_pad // kdb)) :, :] = 0
+
+                attn_sum = (
+                    attn_weights_slice.view(
+                        batch_size,
+                        num_kv_head,
+                        num_blocks_per_chunk,
+                        reshaped_block_size // kdb,
+                        -1,
+                        reshaped_block_size,
+                    )
+                    .sum(dim=-1)
+                    .sum(dim=-2)
+                    .to("cuda")
+                )
+                del chunked_query
+            
+            simple_mask = find_blocks_chunked(
+                attn_sum,
+                k_block_num - q_block_num + chunk_idx * num_blocks_per_chunk,
+                threshold,
+                None,
+                decoding=False,
+                mode="prefill",
+                causal=causal,
+            )
+
+            attn_sum_list.append(attn_sum)
+            simple_mask_list.append(simple_mask)
+
+            del attn_weights_slice
+
+        if not use_triton:
+            del reshaped_query, reshaped_key
+        attn_sums = torch.cat(attn_sum_list, dim=-2)
+        simple_masks = torch.cat(simple_mask_list, dim=-2)
 
     if causal:
         simple_masks[:, :, -q_block_num:, -q_block_num:] = torch.where(
@@ -303,7 +394,7 @@ def Xattention_prefill(
     query_states: torch.Tensor,
     key_states: torch.Tensor,
     value_states: torch.Tensor,
-    stride,
+    stride=16,
     norm=1,
     threshold=0.8,
     block_size=128,
@@ -313,6 +404,7 @@ def Xattention_prefill(
     chunk_size=None,
     keep_sink=False,
     keep_recent=False,
+    use_pooling=False
 ):
     batch_size, num_heads, k_len, head_dim = key_states.shape
     _, _, q_len, _ = query_states.shape
@@ -343,6 +435,7 @@ def Xattention_prefill(
         kdb=kdb,
         keep_sink=keep_sink,
         keep_recent=keep_recent,
+        use_pooling=use_pooling
     )
 
     if query_states.device != key_states.device:
@@ -374,7 +467,7 @@ def Xattention_prefill(
     assert value_states.device == query_states.device
     assert approx_simple_mask.device == query_states.device
 
-    attn_output = block_sparse_attn_func(
+    attn_output = block_sparse_attn_func(   # dahu: here to optimize
         query_states,
         key_states,
         value_states,

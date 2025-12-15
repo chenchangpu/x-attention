@@ -33,12 +33,14 @@ import os
 
 if __name__ == "__main__":
 
-    lens = [4,8,16,32,64,128]
+    lens = [32]
 
     speedups_flex = []
     speedups_xattn_8 = []
     speedups_xattn_16 = []
     speedups_minfer = []
+    speedups_xattn_8_pooling = []
+    speedups_xattn_16_pooling = []
     past_key_values = None
     for len in lens:
         print(f"Testing {len}K")
@@ -48,7 +50,7 @@ if __name__ == "__main__":
         layer_to_save = 12
         if not os.path.exists(query_path) or not os.path.exists(key_path):
             
-            model, tokenizer = load_fake_model(name_or_path="meta-llama/Llama-3.1-8B-Instruct", layer_to_save=layer_to_save, target_len=len*1024)
+            model, tokenizer = load_fake_model(name_or_path="/data3/Llama-3-8B-Instruct-Gradient-1048k", layer_to_save=layer_to_save, target_len=len*1024)
             input_ids = generate_prompt(tokenizer,len*1024)
             chunk_size = 4096
             if past_key_values is not None:
@@ -76,7 +78,8 @@ if __name__ == "__main__":
         gamma = 0.95
         tau = 0.1
         # Xattention args
-        threshold = torch.tensor(llama_fuse_8)[layer_to_save]
+        threshold_s8 = torch.tensor(llama_fuse_8)[layer_to_save]
+        threshold_s16 = torch.tensor(llama_fuse_16)[layer_to_save]
         stride = 16
         v = torch.randn(q.shape, dtype=torch.bfloat16).to("cuda").contiguous()
         num_iterations = 50
@@ -84,8 +87,10 @@ if __name__ == "__main__":
         # warm up
         for i in range(num_warmups):
             try:
-                Xattention_prefill(q, k, v, stride=16, threshold=threshold, use_triton=True)
-                Xattention_prefill(q, k, v, stride=8, threshold=threshold, use_triton=True)
+                Xattention_prefill(q, k, v, stride=16, threshold=threshold_s16, use_triton=True)
+                Xattention_prefill(q, k, v, stride=8, threshold=threshold_s8, use_triton=True)
+                Xattention_prefill(q, k, v, stride=16, threshold=threshold_s16, use_triton=True, use_pooling=True)
+                Xattention_prefill(q, k, v, stride=8, threshold=threshold_s8, use_triton=True, use_pooling=True)
             except:
                 XATTN_PREFILL = False
             try:
@@ -117,19 +122,37 @@ if __name__ == "__main__":
         for _ in range(num_iterations):
             torch.cuda.synchronize()
             start_time = time.time()
-            flex_prefill_output = Xattention_prefill(q, k, v, stride=8, threshold= threshold, use_triton=True,chunk_size=min(32768,len*1024))
+            flex_prefill_output = Xattention_prefill(q, k, v, stride=8, threshold=threshold_s8, use_triton=True,chunk_size=2048)
             torch.cuda.synchronize()
             total_time_xattn_8 += time.time() - start_time
         avg_time_xattn_8 = total_time_xattn_8 / num_iterations
+        
+        total_time_xattn_8_pooling = 0
+        for _ in range(num_iterations):
+            torch.cuda.synchronize()
+            start_time = time.time()
+            flex_prefill_output = Xattention_prefill(q, k, v, threshold=threshold_s8, use_pooling=True)
+            torch.cuda.synchronize()
+            total_time_xattn_8_pooling += time.time() - start_time
+        avg_time_xattn_8_pooling = total_time_xattn_8_pooling / num_iterations
 
         total_time_xattn_16 = 0
         for _ in range(num_iterations):
             torch.cuda.synchronize()
             start_time = time.time()
-            flex_prefill_output = Xattention_prefill(q, k, v, stride=16, threshold= threshold, use_triton=True,chunk_size=min(32768,len*1024))
+            flex_prefill_output = Xattention_prefill(q, k, v, stride=16, threshold=threshold_s16, use_triton=True,chunk_size=2048)
             torch.cuda.synchronize()
             total_time_xattn_16 += time.time() - start_time
         avg_time_xattn_16 = total_time_xattn_16 / num_iterations
+        
+        total_time_xattn_16_pooling = 0
+        for _ in range(num_iterations):
+            torch.cuda.synchronize()
+            start_time = time.time()
+            flex_prefill_output = Xattention_prefill(q, k, v, threshold=threshold_s16, use_pooling=True)
+            torch.cuda.synchronize()
+            total_time_xattn_16_pooling += time.time() - start_time
+        avg_time_xattn_16_pooling = total_time_xattn_16_pooling / num_iterations
 
         # For minference
         total_time_minfer = 0
@@ -149,23 +172,29 @@ if __name__ == "__main__":
         total_time_flashinfer = 0
         torch.cuda.synchronize()
         start_time = time.time()
-        o = Full_prefill(q, k, v, causal=False)
+        # o = Full_prefill(q, k, v, causal=False)
+        o = Full_prefill(q, k, v, causal=True)
         torch.cuda.synchronize()
         total_time_flashinfer += time.time() - start_time
         avg_time_flashinfer = total_time_flashinfer
 
         # Calculate speedups
-        print(f"{len}K Minfer {avg_time_minfer:.4f} flex: {avg_time_flex:.4f} xattn_8: {avg_time_xattn_8:.4f} xattn_16: {avg_time_xattn_16:.4f} full: {avg_time_flashinfer:.4f} ")
+        print(f"{len}K Minfer {avg_time_minfer:.4f} flex: {avg_time_flex:.4f} xattn_8: {avg_time_xattn_8:.4f} xattn_16: {avg_time_xattn_16:.4f} full: {avg_time_flashinfer:.4f} xattn_8_pooling: {avg_time_xattn_8_pooling:.4f} xattn_16_pooling: {avg_time_xattn_16_pooling:.4f}")
         speedup_flex = avg_time_flashinfer / avg_time_flex
         speedup_xattn_8 = avg_time_flashinfer / avg_time_xattn_8
         speedup_xattn_16 = avg_time_flashinfer / avg_time_xattn_16
         speedup_minfer = avg_time_flashinfer / avg_time_minfer
+        speedup_xattn_8_p = avg_time_flashinfer / avg_time_xattn_8_pooling
+        speedup_xattn_16_p = avg_time_flashinfer / avg_time_xattn_16_pooling
         speedups_flex.append(speedup_flex)
         speedups_xattn_8.append(speedup_xattn_8)
         speedups_xattn_16.append(speedup_xattn_16)
         speedups_minfer.append(speedup_minfer)
+        speedups_xattn_8_pooling.append(speedup_xattn_8_p)
+        speedups_xattn_16_pooling.append(speedup_xattn_16_p)
 
     # Output results
-    print(f"\n{'Length':<10}{'Flex Speedup':<15}{'Xattn 8 Speedup':<20}{'Xattn 16 Speedup':<25}{'Minfer Speedup'}")
-    for len, speedup_flex, speedup_xattn_8, speedup_xattn_16,speedup_minfer in zip(lens, speedups_flex, speedups_xattn_8, speedups_xattn_16, speedups_minfer):
-        print(f"{str(len):<10}{speedup_flex:<15.2f}{speedup_xattn_8:<20.2f}{speedup_xattn_16:<25.2f}{speedup_minfer:.2f}")
+    print(f"\n{'Length':<10}{'Flex Speedup':<15}{'Xattn 8 Speedup':<20}{'Xattn 16 Speedup':<25}{'Minfer Speedup':<30}{'Xattn 8 pooling Speedup':<35}{'Xattn 16 pooling Speedup'}")
+    for len, speedup_flex, speedup_xattn_8, speedup_xattn_16,speedup_minfer,speedup_xattn_8_p, speedup_xattn_16_p \
+        in zip(lens, speedups_flex, speedups_xattn_8, speedups_xattn_16, speedups_minfer, speedups_xattn_8_pooling, speedups_xattn_16_pooling):
+        print(f"{str(len):<10}{speedup_flex:<15.2f}{speedup_xattn_8:<20.2f}{speedup_xattn_16:<25.2f}{speedup_minfer:<30.2f}{speedup_xattn_8_p:<35.2f}{speedup_xattn_16_p:.2f}")

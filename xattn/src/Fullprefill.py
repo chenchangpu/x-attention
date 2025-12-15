@@ -10,6 +10,8 @@ def Full_prefill(
 ):
     if attention_mask is not None and attention_mask.dtype != bool:
         attention_mask = torch.where(attention_mask == 0,True,False)
+    # note: close cuda graph for torch profiling (if run scripts/run_profile_demo.sh)
+    # torch.randn((), device="cuda")  
     attn_output = flashinfer.single_prefill_with_kv_cache(
         query_states.transpose(1, 2).squeeze(0),
         key_states.transpose(1, 2).squeeze(0),

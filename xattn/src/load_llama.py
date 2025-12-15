@@ -167,14 +167,19 @@ def forward_eval(
             start_time = time.time()
             print(f"q length: {q_len} k length: {k_len}")
         stride = self.fastprefillconfig.stride
+        use_pooling = self.fastprefillconfig.use_pooling
         if not decoding:
             if self.fastprefillconfig.metric == "flex":
                 attn_output = Flexprefill_prefill(query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2)).transpose(1, 2)
             elif self.fastprefillconfig.metric == "xattn":
                 if isinstance(self.fastprefillconfig.threshold, torch.Tensor):
-                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold[self.layer_idx], use_triton=True)
+                    attn_output = Xattention_prefill(query_states.contiguous(), key_states.contiguous(), value_states.contiguous(), stride, norm=1, 
+                                                     threshold=self.fastprefillconfig.threshold[self.layer_idx], use_triton=True, use_pooling=use_pooling,
+                                                     keep_recent=True, keep_sink=True)
                 else:
-                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold, use_triton=True)
+                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, 
+                                                     threshold=self.fastprefillconfig.threshold, use_triton=True, use_pooling=use_pooling,
+                                                     keep_recent=True, keep_sink=True)
             elif self.fastprefillconfig.metric == "full":
                 attn_output = Full_prefill(query_states, key_states, value_states,attention_mask=attention_mask)
             elif self.fastprefillconfig.metric == "minfer":
@@ -241,7 +246,8 @@ class FastPrefillConfig(dict):
         threshold:float=None,
         print_detail:bool=False,
         stride = 16,
-        metric = "xattn"
+        metric = "xattn",
+        use_pooling = False
     ):
         """
         Initialize the configuration with default or user-provided values.
@@ -260,6 +266,7 @@ class FastPrefillConfig(dict):
             elif stride == 4:
                 self.threshold = torch.tensor(llama_fuse_4)
         self.threshold = self.threshold.to("cuda")
+        self.use_pooling = use_pooling
         
 def load_model(fastprefillconfig=FastPrefillConfig(),name_or_path=""):
     """
@@ -281,6 +288,7 @@ def load_model(fastprefillconfig=FastPrefillConfig(),name_or_path=""):
         name_or_path,
         device_map="balanced", 
         torch_dtype=torch.bfloat16,
+        use_flash_attention_2=True              # here
     )
     model.eval()
     for layer in model.model.layers:
@@ -381,14 +389,17 @@ def forward_to_save(
             start_time = time.time()
             print(f"q length: {q_len} k length: {k_len}")
         stride = self.fastprefillconfig.stride
+        use_pooling = self.fastprefillconfig.use_pooling
         if not decoding:
             if self.fastprefillconfig.metric == "flex":
                 attn_output = Flexprefill_prefill(query_states.transpose(1, 2), key_states.transpose(1, 2), value_states.transpose(1, 2)).transpose(1, 2)
             elif self.fastprefillconfig.metric == "xattn":
                 if isinstance(self.fastprefillconfig.threshold, torch.Tensor):
-                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold[self.layer_idx], use_triton=True)
+                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold[self.layer_idx], 
+                                                     use_triton=True, use_pooling=use_pooling)
                 else:
-                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold, use_triton=True)
+                    attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, threshold=self.fastprefillconfig.threshold, 
+                                                     use_triton=True, use_pooling=use_pooling)
             elif self.fastprefillconfig.metric == "full":
                 attn_output = Full_prefill(query_states, key_states, value_states,attention_mask=attention_mask)
             elif self.fastprefillconfig.metric == "minfer":

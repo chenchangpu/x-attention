@@ -9,6 +9,18 @@ from xattn.src.kernels import (
     flat_group_gemm_fuse_reshape,
 )
 from block_sparse_attn import block_sparse_attn_func
+ENABLE_TRITON_ATTENTION = True
+try:
+    from xattn.src.block_sparse_128_128_triton import block_sparse_triton_128_128
+except:
+    ENABLE_TRITON_ATTENTION = False
+    
+ENABLE_TILELANG_ATTENTION = True
+try:
+    from xattn.src.block_sparse_128_128_tilelang import blocksparse_flashattn
+except:
+    ENABLE_TILELANG_ATTENTION = False
+
 
 def top_p_mask(attn_prob: torch.Tensor, threshold: Optional[float | torch.Tensor]):
     """
@@ -96,9 +108,13 @@ def xattn_estimate(
             
         pad_key_states_pooling = pad_key_states.view(batch_size, num_kv_head, k_block_num, block_size, head_dim).mean(dim=-2)
         # -> batch_size, num_kv_head, k_block_num, head_dim
+        if k_num_to_pad > 0:
+            pad_key_states_pooling[:, :, -1, :] = pad_key_states_pooling[:, :, -1, :] * block_size / (block_size - k_num_to_pad)
         pad_query_states_pooling = pad_query_states.view(batch_size, num_q_head, q_block_num, block_size, head_dim).mean(dim=-2)
+        if q_num_to_pad > 0:
+            pad_query_states_pooling[:, :, -1, :] = pad_query_states_pooling[:, :, -1, :] * block_size / (block_size - q_num_to_pad)
         # -> batch_size, num_q_head, q_block_num, head_dim
-        attn_weight = torch.matmul(pad_query_states_pooling, pad_key_states_pooling.transpose(2,3))
+        attn_weight = torch.matmul(pad_query_states_pooling, pad_key_states_pooling.transpose(2,3)) / math.sqrt(head_dim)
         # -> batch_size, num_q_head, q_block_num, k_block_num
         if causal:
             q_idx = torch.arange(q_block_num, device=attn_weight.device)[:, None]
@@ -404,7 +420,8 @@ def Xattention_prefill(
     chunk_size=None,
     keep_sink=False,
     keep_recent=False,
-    use_pooling=False
+    use_pooling=False,
+    block_sparse_kernel=0   # 0 -> Block Sparse, 1 -> triton, 2 -> tilelang
 ):
     batch_size, num_heads, k_len, head_dim = key_states.shape
     _, _, q_len, _ = query_states.shape
@@ -448,43 +465,64 @@ def Xattention_prefill(
     ####################
     assert block_size == 128
     assert batch_size == 1
-    query_states = query_states.transpose(1, 2).view(q_len, num_heads, head_dim)
-    key_states = key_states.transpose(1, 2).view(k_len, num_heads, head_dim)
-    value_states = value_states.transpose(1, 2).view(k_len, num_heads, head_dim)
-    q_cu_seq_lens = torch.tensor(
-        [0, q_len], dtype=torch.int32, device=query_states.device
-    )
-    k_cu_seq_lens = torch.tensor(
-        [0, k_len], dtype=torch.int32, device=query_states.device
-    )
-    head_mask_type = torch.tensor(
-        [1 for _ in range(num_heads)], device=query_states.device, dtype=torch.int32
-    )
-    assert head_mask_type.device == query_states.device
-    assert q_cu_seq_lens.device == query_states.device
-    assert k_cu_seq_lens.device == query_states.device
-    assert key_states.device == query_states.device
-    assert value_states.device == query_states.device
-    assert approx_simple_mask.device == query_states.device
+    if block_sparse_kernel == 0:    # Block Sparse
+        query_states = query_states.transpose(1, 2).view(q_len, num_heads, head_dim)
+        key_states = key_states.transpose(1, 2).view(k_len, num_heads, head_dim)
+        value_states = value_states.transpose(1, 2).view(k_len, num_heads, head_dim)
+        q_cu_seq_lens = torch.tensor(
+            [0, q_len], dtype=torch.int32, device=query_states.device
+        )
+        k_cu_seq_lens = torch.tensor(
+            [0, k_len], dtype=torch.int32, device=query_states.device
+        )
+        head_mask_type = torch.tensor(
+            [1 for _ in range(num_heads)], device=query_states.device, dtype=torch.int32
+        )
+        assert head_mask_type.device == query_states.device
+        assert q_cu_seq_lens.device == query_states.device
+        assert k_cu_seq_lens.device == query_states.device
+        assert key_states.device == query_states.device
+        assert value_states.device == query_states.device
+        assert approx_simple_mask.device == query_states.device
 
-    attn_output = block_sparse_attn_func(   # dahu: here to optimize
-        query_states,
-        key_states,
-        value_states,
-        q_cu_seq_lens,
-        k_cu_seq_lens,
-        head_mask_type,
-        None,
-        approx_simple_mask[:, :, :q_block_num, :k_block_num].contiguous(),
-        q_len,
-        k_len,
-        p_dropout=0.0,
-        deterministic=True,
-        is_causal=causal,
-    )
-    attn_output = attn_output.view(batch_size, q_len, num_heads, head_dim).transpose(
-        1, 2
-    )
+        attn_output = block_sparse_attn_func(   # dahu: here to optimize
+            query_states,
+            key_states,
+            value_states,
+            q_cu_seq_lens,
+            k_cu_seq_lens,
+            head_mask_type,
+            None,
+            approx_simple_mask[:, :, :q_block_num, :k_block_num].contiguous(),
+            q_len,
+            k_len,
+            p_dropout=0.0,
+            deterministic=True,
+            is_causal=causal,
+        )
+        attn_output = attn_output.view(batch_size, q_len, num_heads, head_dim).transpose(
+            1, 2
+        )
+    elif block_sparse_kernel == 1:  # triton kernel
+        assert q_len == k_len
+        assert ENABLE_TRITON_ATTENTION == True
+        attn_output = block_sparse_triton_128_128(query_states,
+                                                  key_states,
+                                                  value_states,
+                                                  approx_simple_mask[:, :, :q_block_num, :k_block_num].contiguous(),
+                                                  causal,
+                                                  1.0 / (head_dim**0.5),
+                                                  True  # use warp specilize
+                                                  )
+    else:   # tilelang
+        assert q_len == k_len
+        assert ENABLE_TILELANG_ATTENTION == True
+        kernel = blocksparse_flashattn(batch_size, num_heads, q_len, head_dim, math.ceil(q_len/block_size), is_causal=causal)
+        attn_output = kernel(query_states, 
+                             key_states, 
+                             value_states, 
+                             approx_simple_mask[:, :, :q_block_num, :k_block_num].contiguous()
+                            )
     ################################
 
     del query_states

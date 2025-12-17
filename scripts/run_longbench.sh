@@ -1,9 +1,13 @@
+export CUDA_VISIBLE_DEVICES=0
+
 models="Meta-Llama-3.1-8B-Instruct"
 # Xattention
-methods="xattn"
+# methods="xattn-pooling"
 # Baselines
-# methods="full flex minference"
-tasks="samsum narrativeqa qasper triviaqa hotpotqa multifieldqa_en multifieldqa_zh 2wikimqa musique dureader gov_report qmsum multi_news vcsum trec lsht passage_count passage_retrieval_en passage_retrieval_zh lcc repobench-p"
+methods="full flex minference"
+# tasks="2wikimqa"
+tasks="2wikimqa qasper gov_report triviaqa lcc"
+# tasks="samsum narrativeqa qasper triviaqa hotpotqa multifieldqa_en multifieldqa_zh 2wikimqa musique dureader gov_report qmsum multi_news vcsum trec lsht passage_count passage_retrieval_en passage_retrieval_zh lcc repobench-p"
 
 for model in $models; do
     for task in $tasks; do
@@ -15,5 +19,5 @@ done
 
 cd eval/LongBench
 for model in $models; do
-    python -u eval.py --model $model &
+    python -u eval.py --model $model
 done

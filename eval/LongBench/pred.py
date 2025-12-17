@@ -1,5 +1,5 @@
 import os
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 import torch
 import json
 from transformers import (
@@ -138,6 +138,22 @@ def new_attention_forward(
                 use_triton=True,
                 keep_sink=True,
                 keep_recent=True,
+                # use_pooling=True
+            )
+        if self.method == "xattn-pooling":
+            self.threshold = self.threshold.to(key_states.device)
+            threshold = self.threshold
+            attn_output = Xattention_prefill(
+                query_states,
+                key_states,
+                value_states,
+                norm=1,
+                stride=8,
+                threshold=threshold,
+                use_triton=True,
+                keep_sink=True,
+                keep_recent=True,
+                use_pooling=True
             )
         elif self.method == "flex":
             attn_output = Flexprefill_prefill(
@@ -289,7 +305,7 @@ def load_model_and_tokenizer(path, model_name):
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         device_map="auto",
-        attn_implementation="eager",
+        attn_implementation="flash_attention_2",
     )
 
     generation_config = GenerationConfig.from_pretrained(path)
@@ -319,7 +335,7 @@ if __name__ == "__main__":
         if name.split(".")[-1] == "self_attn":
             layer_idx = int(name.split(".")[2])
             module.method = args.method
-            if args.method == "xattn":
+            if args.method == "xattn" or args.method == "xattn-pooling":
                 module.threshold = torch.tensor(max[layer_idx])
             module.forward = types.MethodType(new_attention_forward, module)
 
@@ -350,14 +366,17 @@ if __name__ == "__main__":
         os.makedirs("eval/LongBench/pred")
     if not os.path.exists("eval/LongBench/pred_e"):
         os.makedirs("eval/LongBench/pred_e")
+    data_root = "/data1/cp_data/longbench_disk" 
     for dataset in datasets:
-        data = load_dataset("THUDM/LongBench", dataset, split="test")
+        data = load_from_disk(os.path.join(data_root, dataset))
         if not os.path.exists(f"eval/LongBench/pred/{model_name}"):
             os.makedirs(f"eval/LongBench/pred/{model_name}")
         if args.method == "full":
             out_path = f"eval/LongBench/pred/{model_name}/{dataset}-full.jsonl"
         elif args.method == "xattn":
             out_path = f"eval/LongBench/pred/{model_name}/{dataset}-xattn-stride=8.jsonl"
+        elif args.method == "xattn-pooling":
+            out_path = f"eval/LongBench/pred/{model_name}/{dataset}-xattn-pooling.jsonl"
         elif args.method == "flex":
             out_path = f"eval/LongBench/pred/{model_name}/{dataset}-flex.jsonl"
         elif args.method == "minference":

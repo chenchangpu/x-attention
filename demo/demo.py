@@ -37,9 +37,12 @@ if __name__ == "__main__":
     parser.add_argument("--threshold", type=float, default=None)
     parser.add_argument("--metric", type=str, default='xattn')
     parser.add_argument("--use-pooling", action="store_true")
+    parser.add_argument("--block-sparse-kernel", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=0)
     args = parser.parse_args()
-    config = FastPrefillConfig(metric = args.metric,stride = args.stride, threshold = args.threshold, use_pooling = True if args.use_pooling else False)
+    config = FastPrefillConfig(metric = args.metric,stride = args.stride, threshold = args.threshold, 
+                               use_pooling = True if args.use_pooling else False,
+                               block_sparse_kernel= args.block_sparse_kernel)
     
     model, tokenizer = load_model(name_or_path="/data3/Llama-3-8B-Instruct-Gradient-1048k", fastprefillconfig=config)
     input_ids = generate_prompt(tokenizer,args.len)

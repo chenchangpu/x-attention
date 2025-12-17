@@ -175,11 +175,13 @@ def forward_eval(
                 if isinstance(self.fastprefillconfig.threshold, torch.Tensor):
                     attn_output = Xattention_prefill(query_states.contiguous(), key_states.contiguous(), value_states.contiguous(), stride, norm=1, 
                                                      threshold=self.fastprefillconfig.threshold[self.layer_idx], use_triton=True, use_pooling=use_pooling,
-                                                     keep_recent=True, keep_sink=True)
+                                                     keep_recent=True, keep_sink=True, 
+                                                     block_sparse_kernel=self.fastprefillconfig.block_sparse_kernel)
                 else:
                     attn_output = Xattention_prefill(query_states, key_states, value_states, stride, norm=1, 
                                                      threshold=self.fastprefillconfig.threshold, use_triton=True, use_pooling=use_pooling,
-                                                     keep_recent=True, keep_sink=True)
+                                                     keep_recent=True, keep_sink=True,
+                                                     block_sparse_kernel=self.fastprefillconfig.block_sparse_kernel)
             elif self.fastprefillconfig.metric == "full":
                 attn_output = Full_prefill(query_states, key_states, value_states,attention_mask=attention_mask)
             elif self.fastprefillconfig.metric == "minfer":
@@ -247,7 +249,8 @@ class FastPrefillConfig(dict):
         print_detail:bool=False,
         stride = 16,
         metric = "xattn",
-        use_pooling = False
+        use_pooling = False,
+        block_sparse_kernel=0
     ):
         """
         Initialize the configuration with default or user-provided values.
@@ -267,6 +270,7 @@ class FastPrefillConfig(dict):
                 self.threshold = torch.tensor(llama_fuse_4)
         self.threshold = self.threshold.to("cuda")
         self.use_pooling = use_pooling
+        self.block_sparse_kernel = block_sparse_kernel
         
 def load_model(fastprefillconfig=FastPrefillConfig(),name_or_path=""):
     """
